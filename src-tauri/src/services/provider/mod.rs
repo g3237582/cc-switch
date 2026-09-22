@@ -2708,6 +2708,91 @@ wire_api = "responses"
 
     #[test]
     #[serial]
+    fn managed_codex_switch_writes_only_bound_live_auth_and_keeps_oauth_store() {
+        with_test_home(|state, _| {
+            crate::settings::reload_settings().expect("reload settings");
+            tauri::async_runtime::block_on(async {
+                state
+                    .codex_oauth_manager
+                    .add_test_account_with_user_identity("acct-a", "managed-access-a", "user-a")
+                    .await
+                    .expect("seed account A");
+                state
+                    .codex_oauth_manager
+                    .add_test_account_with_user_identity("acct-b", "managed-access-b", "user-b")
+                    .await
+                    .expect("seed account B");
+            });
+
+            let provider_a = managed_codex_provider("managed-a", "acct-a");
+            let provider_b = managed_codex_provider("managed-b", "acct-b");
+            for provider in [&provider_a, &provider_b] {
+                state
+                    .db
+                    .save_provider(AppType::Codex.as_str(), provider)
+                    .expect("save provider");
+            }
+
+            ProviderService::switch(state, AppType::Codex, &provider_a.id)
+                .expect("activate managed A");
+            let live_a: Value =
+                read_json_file(&crate::codex_config::get_codex_auth_path()).expect("read A auth");
+            assert_eq!(
+                live_a.pointer("/tokens/account_id").and_then(Value::as_str),
+                Some("acct-a")
+            );
+
+            ProviderService::switch(state, AppType::Codex, &provider_b.id)
+                .expect("switch to managed B");
+            let live_b: Value =
+                read_json_file(&crate::codex_config::get_codex_auth_path()).expect("read B auth");
+            assert_eq!(
+                live_b.pointer("/tokens/account_id").and_then(Value::as_str),
+                Some("acct-b"),
+                "live auth must materialize only the bound account"
+            );
+
+            let accounts = tauri::async_runtime::block_on(state.codex_oauth_manager.list_accounts());
+            assert_eq!(accounts.len(), 2, "provider switch must not prune OAuth store");
+            assert!(accounts.iter().any(|account| account.id == "acct-a"));
+            assert!(accounts.iter().any(|account| account.id == "acct-b"));
+        });
+    }
+
+    #[test]
+    #[serial]
+    fn remapping_codex_oauth_account_bindings_updates_provider_meta() {
+        with_test_home(|state, _| {
+            let provider = managed_codex_provider("managed-official", "old-local-id");
+            state
+                .db
+                .save_provider(AppType::Codex.as_str(), &provider)
+                .expect("save provider");
+
+            let updated = state
+                .db
+                .remap_codex_oauth_account_bindings("old-local-id", "new-local-id")
+                .expect("remap bindings");
+            assert_eq!(updated, 1);
+
+            let saved = state
+                .db
+                .get_provider_by_id("managed-official", AppType::Codex.as_str())
+                .expect("query provider")
+                .expect("provider exists");
+            assert_eq!(
+                saved
+                    .meta
+                    .as_ref()
+                    .and_then(|meta| meta.managed_account_id_for("codex_oauth"))
+                    .as_deref(),
+                Some("new-local-id")
+            );
+        });
+    }
+
+    #[test]
+    #[serial]
     fn managed_codex_direct_update_adopts_outgoing_cli_rotation_and_commits_target_binding() {
         with_test_home(|state, _| {
             crate::settings::reload_settings().expect("reload settings");
