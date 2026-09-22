@@ -1,0 +1,112 @@
+name: Build Windows artifact
+
+# Unsigned fork build for manual install. Does not use Tauri signing secrets.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-artifact-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  windows:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup pnpm
+        shell: pwsh
+        env:
+          COREPACK_ENABLE_DOWNLOAD_PROMPT: "0"
+        run: |
+          corepack enable
+          corepack install
+          node --version
+          pnpm --version
+
+      - name: Install frontend deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Build unsigned Windows bundles
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          # createUpdaterArtifacts signs updater payloads and fails without
+          # TAURI_SIGNING_PRIVATE_KEY. This fork build skips signing.
+          if (Test-Path Env:TAURI_SIGNING_PRIVATE_KEY) {
+            Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY
+          }
+          if (Test-Path Env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD) {
+            Remove-Item Env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+          }
+          $unsignedConfig = Join-Path $env:RUNNER_TEMP 'tauri-unsigned.json'
+          '{"bundle":{"createUpdaterArtifacts":false}}' | Set-Content -Path $unsignedConfig -Encoding ascii
+          pnpm tauri build --bundles msi,nsis --config $unsignedConfig
+
+      - name: Collect MSI, NSIS, and portable zip
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+          $bundleRoot = 'src-tauri/target/release/bundle'
+
+          $msi = Get-ChildItem -Path (Join-Path $bundleRoot 'msi') -Recurse -Filter *.msi -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($null -eq $msi) {
+            $msi = Get-ChildItem -Path $bundleRoot -Recurse -Filter *.msi -ErrorAction SilentlyContinue | Select-Object -First 1
+          }
+          if ($null -eq $msi) {
+            throw 'No MSI installer found'
+          }
+          Copy-Item $msi.FullName (Join-Path release-assets $msi.Name)
+          Write-Host "MSI: $($msi.Name)"
+
+          $nsis = Get-ChildItem -Path (Join-Path $bundleRoot 'nsis') -Recurse -Include *-setup.exe,*.exe -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -notmatch 'uninstall' } |
+            Select-Object -First 1
+          if ($null -eq $nsis) {
+            throw 'No NSIS setup exe found'
+          }
+          Copy-Item $nsis.FullName (Join-Path release-assets $nsis.Name)
+          Write-Host "NSIS: $($nsis.Name)"
+
+          $exeCandidates = @(
+            'src-tauri/target/release/cc-switch.exe',
+            'src-tauri/target/x86_64-pc-windows-msvc/release/cc-switch.exe'
+          )
+          $exePath = $exeCandidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if ($null -eq $exePath) {
+            throw 'cc-switch.exe not found for portable zip'
+          }
+          $portableDir = 'release-assets/CC-Switch-Portable'
+          New-Item -ItemType Directory -Force -Path $portableDir | Out-Null
+          Copy-Item $exePath (Join-Path $portableDir 'cc-switch.exe')
+          @(
+            '# CC Switch portable build marker',
+            'portable=true'
+          ) | Set-Content -Path (Join-Path $portableDir 'portable.ini') -Encoding UTF8
+          $portableZip = 'release-assets/CC-Switch-Windows-Portable.zip'
+          Compress-Archive -Path "$portableDir/*" -DestinationPath $portableZip -Force
+          Remove-Item -Recurse -Force $portableDir
+          Write-Host "Portable: $portableZip"
+          Get-ChildItem release-assets | Format-Table Name, Length
+
+      - name: Upload Windows artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cc-switch-windows-multiaccount-fix
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 14
