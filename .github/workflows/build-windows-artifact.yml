@@ -59,7 +59,8 @@ jobs:
           }
           $unsignedConfig = Join-Path $env:RUNNER_TEMP 'tauri-unsigned.json'
           '{"bundle":{"createUpdaterArtifacts":false}}' | Set-Content -Path $unsignedConfig -Encoding ascii
-          pnpm tauri build --bundles msi,nsis --config $unsignedConfig
+          # pnpm script forwarding collapses "--bundles msi,nsis" into one token.
+          pnpm exec tauri build --bundles msi --bundles nsis --config "$unsignedConfig"
 
       - name: Collect MSI, NSIS, and portable zip
         shell: pwsh
