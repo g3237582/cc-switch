@@ -1,8 +1,13 @@
 name: Build Windows artifact
 
 # Unsigned fork build for manual install. Does not use Tauri signing secrets.
+# workflow_dispatch is the manual entry. The branch push trigger starts a run
+# when the Actions token cannot create a dispatch event (integration 403).
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - cursor/fix-codex-oauth-multi-account-5378
 
 permissions:
   contents: read
