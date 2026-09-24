@@ -191,10 +191,27 @@ pub async fn auth_poll_for_account(
                 })
                 .await
             {
-                Ok(account) => {
+                Ok(outcome) => {
                     let default_account_id = auth_manager.get_status().await.default_account_id;
-                    Ok(account.map(|account| {
-                        map_account(auth_provider, account, default_account_id.as_deref())
+                    if let Some(outcome) = outcome.as_ref() {
+                        for old_account_id in &outcome.remapped_from {
+                            if let Err(err) = app_state.db.remap_codex_oauth_account_bindings(
+                                old_account_id,
+                                &outcome.account.id,
+                            ) {
+                                log::warn!(
+                                    "[CodexOAuth] failed to remap provider bindings {old_account_id} -> {}: {err}",
+                                    outcome.account.id
+                                );
+                            }
+                        }
+                    }
+                    Ok(outcome.map(|outcome| {
+                        map_account(
+                            auth_provider,
+                            outcome.account,
+                            default_account_id.as_deref(),
+                        )
                     }))
                 }
                 Err(CodexOAuthError::AuthorizationPending) => Ok(None),

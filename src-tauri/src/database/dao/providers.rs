@@ -601,6 +601,74 @@ impl Database {
         }))
     }
 
+    /// Remap Codex OAuth `meta.authBinding.accountId` from an old local account
+    /// ID to a surviving ID after login consolidation.
+    pub fn remap_codex_oauth_account_bindings(
+        &self,
+        old_account_id: &str,
+        new_account_id: &str,
+    ) -> Result<usize, AppError> {
+        let old_account_id = old_account_id.trim();
+        let new_account_id = new_account_id.trim();
+        if old_account_id.is_empty()
+            || new_account_id.is_empty()
+            || old_account_id == new_account_id
+        {
+            return Ok(0);
+        }
+
+        let mut conn = lock_conn!(self.conn);
+        let tx = conn
+            .transaction()
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let mut stmt = tx
+            .prepare("SELECT id, app_type, meta FROM providers WHERE meta LIKE ?1")
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        let like_account = format!("%{old_account_id}%");
+        let rows = stmt
+            .query_map(params![like_account], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                ))
+            })
+            .map_err(|e| AppError::Database(e.to_string()))?;
+
+        let mut updates = Vec::new();
+        for row in rows {
+            let (provider_id, app_type, meta_str) =
+                row.map_err(|e| AppError::Database(e.to_string()))?;
+            let mut meta: ProviderMeta = serde_json::from_str(&meta_str).unwrap_or_default();
+            let Some(binding) = meta.auth_binding.as_mut() else {
+                continue;
+            };
+            if binding.source != crate::provider::AuthBindingSource::ManagedAccount
+                || binding.auth_provider.as_deref() != Some("codex_oauth")
+                || binding.account_id.as_deref() != Some(old_account_id)
+            {
+                continue;
+            }
+            binding.account_id = Some(new_account_id.to_string());
+            let serialized = serde_json::to_string(&meta).map_err(|e| {
+                AppError::Database(format!("Failed to serialize remapped provider meta: {e}"))
+            })?;
+            updates.push((provider_id, app_type, serialized));
+        }
+        drop(stmt);
+
+        let updated = updates.len();
+        for (provider_id, app_type, meta_str) in updates {
+            tx.execute(
+                "UPDATE providers SET meta = ?1 WHERE id = ?2 AND app_type = ?3",
+                params![meta_str, provider_id, app_type],
+            )
+            .map_err(|e| AppError::Database(e.to_string()))?;
+        }
+        tx.commit().map_err(|e| AppError::Database(e.to_string()))?;
+        Ok(updated)
+    }
+
     /// 判断 providers 表是否为空（全 app_type 一起算）。
     ///
     /// 用于区分"全新安装"和"升级用户"：在启动流程 import/seed 之前调用。

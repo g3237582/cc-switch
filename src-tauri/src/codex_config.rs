@@ -778,6 +778,32 @@ pub(crate) fn clear_codex_managed_oauth_live_auth_marker_for_account(
     Ok(())
 }
 
+/// When a local managed account ID is consolidated into another, keep the live
+/// ownership marker pointing at the surviving ID without clearing auth.json.
+pub(crate) fn remap_codex_managed_oauth_live_auth_account_id(
+    old_account_id: &str,
+    new_account_id: &str,
+) -> Result<(), AppError> {
+    let old_account_id = old_account_id.trim();
+    let new_account_id = new_account_id.trim();
+    if old_account_id.is_empty()
+        || new_account_id.is_empty()
+        || old_account_id == new_account_id
+    {
+        return Ok(());
+    }
+    let marker_path = get_codex_managed_oauth_live_auth_marker_path();
+    if !marker_path.exists() {
+        return Ok(());
+    }
+    let mut marker: CodexManagedOAuthLiveAuthMarker = read_json_file(&marker_path)?;
+    if marker.account_id != old_account_id {
+        return Ok(());
+    }
+    marker.account_id = new_account_id.to_string();
+    crate::config::write_json_file(&marker_path, &marker)
+}
+
 /// 切走托管 provider 或从认证中心删除账号时，清理其残留在
 /// `~/.codex/auth.json` 的 ChatGPT 登录。
 ///

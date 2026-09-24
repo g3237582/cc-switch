@@ -1,6 +1,7 @@
 name: Build Windows artifact
 
 # Unsigned fork build for manual install. Does not use Tauri signing secrets.
+# Manual only: a push must not start or cancel a long Windows build.
 on:
   workflow_dispatch:
 
@@ -9,12 +10,14 @@ permissions:
 
 concurrency:
   group: windows-artifact-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   windows:
     runs-on: windows-2022
     timeout-minutes: 90
+    env:
+      CARGO_INCREMENTAL: "1"
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -27,6 +30,12 @@ jobs:
       - name: Setup Rust
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+          key: windows-x86_64-msvc
+
       - name: Setup pnpm
         shell: pwsh
         env:
@@ -36,6 +45,18 @@ jobs:
           corepack install
           node --version
           pnpm --version
+
+      - name: Get pnpm store directory
+        id: pnpm-store
+        shell: bash
+        run: echo "path=$(pnpm store path --silent)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache pnpm store
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.pnpm-store.outputs.path }}
+          key: ${{ runner.os }}-pnpm-store-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: ${{ runner.os }}-pnpm-store-
 
       - name: Install frontend deps
         run: pnpm install --frozen-lockfile
@@ -54,7 +75,8 @@ jobs:
           }
           $unsignedConfig = Join-Path $env:RUNNER_TEMP 'tauri-unsigned.json'
           '{"bundle":{"createUpdaterArtifacts":false}}' | Set-Content -Path $unsignedConfig -Encoding ascii
-          pnpm tauri build --bundles msi,nsis --config $unsignedConfig
+          # pnpm script forwarding collapses "--bundles msi,nsis" into one token.
+          pnpm exec tauri build --bundles msi --bundles nsis --config "$unsignedConfig"
 
       - name: Collect MSI, NSIS, and portable zip
         shell: pwsh

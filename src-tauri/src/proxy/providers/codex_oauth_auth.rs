@@ -12,6 +12,8 @@
 //!
 //! ## 多账号支持
 //! - 每个 ChatGPT 账号独立存储 refresh_token
+//! - 登录按稳定身份合并（id_token sub + workspace，缺 sub 时回退 email + workspace），
+//!   不覆盖/丢弃其他账号；同身份重复本地 ID 会合并并 remap provider 绑定
 //! - Provider 通过 meta.authBinding 关联账号（auth_provider = "codex_oauth"）
 //! - 本地账号 ID 用于绑定和缓存；chatgpt_account_id 仅表示上游 workspace
 
@@ -20,7 +22,6 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::io::Write;
 use std::path::PathBuf;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
@@ -275,6 +276,15 @@ struct AccountLoginContext<'a> {
     target_account_id: Option<&'a str>,
     pending_device_code: Option<&'a str>,
     target_generation: Option<u64>,
+}
+
+/// Result of adding/refreshing a managed Codex OAuth account.
+#[derive(Debug, Clone)]
+pub struct AccountLoginOutcome {
+    pub account: GitHubAccount,
+    /// Local account IDs that were consolidated into `account.id` and removed.
+    /// Callers should remap provider `authBinding.accountId` references.
+    pub remapped_from: Vec<String>,
 }
 
 /// 持久化的账号数据
@@ -561,12 +571,13 @@ impl CodexOAuthManager {
 
     /// 轮询 Device Code 状态
     ///
-    /// 接收 device_code（即 device_auth_id），返回 Some(account) 表示授权成功
+    /// 接收 device_code（即 device_auth_id），返回 Some(outcome) 表示授权成功。
+    /// `remapped_from` lists local IDs consolidated into the surviving account.
     pub async fn poll_for_token<BeforeCommit, CommitFuture, CommitGuard>(
         &self,
         device_code: &str,
         before_commit: BeforeCommit,
-    ) -> Result<Option<GitHubAccount>, CodexOAuthError>
+    ) -> Result<Option<AccountLoginOutcome>, CodexOAuthError>
     where
         BeforeCommit: FnOnce() -> CommitFuture,
         CommitFuture: std::future::Future<Output = CommitGuard>,
@@ -665,8 +676,8 @@ impl CodexOAuthManager {
         let _commit_guard = before_commit().await;
         // 登录提交与该账号的 refresh/adopt 共用一把 generation 锁；账号和
         // access cache 一次写入，旧刷新响应因此不能覆盖新登录链。
-        let account = self
-            .add_account_internal(
+        let outcome = self
+            .add_account_with_outcome(
                 chatgpt_account_id,
                 refresh_token,
                 email,
@@ -684,7 +695,7 @@ impl CodexOAuthManager {
             )
             .await?;
 
-        Ok(Some(account))
+        Ok(Some(outcome))
     }
 
     /// 用 authorization_code + code_verifier 换取 tokens
@@ -1670,31 +1681,62 @@ impl CodexOAuthManager {
         initial_access_token: Option<CachedAccessToken>,
         context: AccountLoginContext<'_>,
     ) -> Result<GitHubAccount, CodexOAuthError> {
+        Ok(self
+            .add_account_with_outcome(
+                chatgpt_account_id,
+                refresh_token,
+                email,
+                id_token,
+                initial_access_token,
+                context,
+            )
+            .await?
+            .account)
+    }
+
+    /// Merge-or-insert a ChatGPT identity into the shared OAuth account store.
+    ///
+    /// Non-targeted logins resolve an existing local `account_id` by stable
+    /// identity (id_token `sub` + chatgpt workspace, falling back to email +
+    /// workspace) so re-login never creates a second row or drops siblings.
+    /// Extra historical rows for the same identity are consolidated and listed
+    /// in `remapped_from` for provider binding migration.
+    async fn add_account_with_outcome(
+        &self,
+        chatgpt_account_id: String,
+        refresh_token: String,
+        email: Option<String>,
+        id_token: Option<String>,
+        initial_access_token: Option<CachedAccessToken>,
+        context: AccountLoginContext<'_>,
+    ) -> Result<AccountLoginOutcome, CodexOAuthError> {
         let _lifecycle = self.lifecycle_lock.read().await;
         let target_account_id = context
             .target_account_id
             .map(str::trim)
             .filter(|account_id| !account_id.is_empty())
             .map(str::to_string);
-        let replacing_existing = target_account_id.is_some();
-        let account_id = target_account_id.unwrap_or_else(|| Uuid::new_v4().to_string());
-        let refresh_lock = if replacing_existing {
-            Some(self.get_refresh_lock(&account_id).await)
+
+        // Targeted reauth takes the account lock early so refresh cannot race.
+        // Ordinary login merges under storage_lock only (same order as refresh:
+        // lifecycle → optional account mutex → storage).
+        let early_refresh_lock = if let Some(account_id) = target_account_id.as_deref() {
+            Some(self.get_refresh_lock(account_id).await)
         } else {
             None
         };
-        let _refresh_guard = match refresh_lock.as_ref() {
+        let _early_refresh_guard = match early_refresh_lock.as_ref() {
             Some(lock) => Some(lock.lock().await),
             None => None,
         };
         let now = chrono::Utc::now().timestamp();
         let now_ms = chrono::Utc::now().timestamp_millis();
 
-        if replacing_existing {
+        if let Some(account_id) = target_account_id.as_deref() {
             let accounts = self.accounts.read().await;
             let existing = accounts
-                .get(&account_id)
-                .ok_or_else(|| CodexOAuthError::AccountNotFound(account_id.clone()))?;
+                .get(account_id)
+                .ok_or_else(|| CodexOAuthError::AccountNotFound(account_id.to_string()))?;
             let expected_workspace = existing
                 .chatgpt_account_id
                 .as_deref()
@@ -1745,18 +1787,6 @@ impl CodexOAuthManager {
             }
         }
 
-        let data = CodexAccountData {
-            account_id: account_id.clone(),
-            chatgpt_account_id: Some(chatgpt_account_id),
-            email,
-            refresh_token,
-            authenticated_at: now,
-            id_token,
-            token_updated_at_ms: now_ms,
-        };
-
-        let account = GitHubAccount::from(&data);
-
         // Linearize cancel/newer-flow against the actual commit, after waiting
         // for the account lock. Holding both guards through persistence means
         // cancellation cannot report success after this point, while a cancel
@@ -1796,43 +1826,85 @@ impl CodexOAuthManager {
         // and its access-token cache untouched.
         let _persist = self.storage_lock.lock().await;
         let mut persisted_accounts = self.accounts.read().await.clone();
-        let new_identity = data
-            .id_token
+        let new_identity = id_token
             .as_deref()
             .and_then(crate::codex_config::extract_codex_id_token_user_identity);
-        let duplicate_exists = new_identity.as_deref().is_some_and(|new_identity| {
-            persisted_accounts
-                .iter()
-                .filter(|(existing_id, _)| existing_id.as_str() != account_id.as_str())
-                .any(|(_, existing)| {
-                    existing
-                        .chatgpt_account_id
-                        .as_deref()
-                        .unwrap_or(existing.account_id.as_str())
-                        == data
-                            .chatgpt_account_id
-                            .as_deref()
-                            .unwrap_or(data.account_id.as_str())
-                        && existing
-                            .id_token
-                            .as_deref()
-                            .and_then(crate::codex_config::extract_codex_id_token_user_identity)
-                            .as_deref()
-                            == Some(new_identity)
-                })
-        });
-        if duplicate_exists {
-            return Err(CodexOAuthError::DuplicateAccount);
-        }
+
+        let mut remapped_from = Vec::new();
+        let account_id = if let Some(target_id) = target_account_id.clone() {
+            // Targeted reauth must not steal another local account's identity.
+            let conflicting = Self::find_stable_identity_matches(
+                &persisted_accounts,
+                &chatgpt_account_id,
+                email.as_deref(),
+                new_identity.as_deref(),
+            )
+            .into_iter()
+            .any(|matched_id| matched_id != target_id);
+            if conflicting {
+                return Err(CodexOAuthError::DuplicateAccount);
+            }
+            target_id
+        } else {
+            let mut matches = Self::find_stable_identity_matches(
+                &persisted_accounts,
+                &chatgpt_account_id,
+                email.as_deref(),
+                new_identity.as_deref(),
+            );
+            matches.sort_by(|left, right| {
+                let left_at = persisted_accounts
+                    .get(left)
+                    .map(|account| account.authenticated_at)
+                    .unwrap_or_default();
+                let right_at = persisted_accounts
+                    .get(right)
+                    .map(|account| account.authenticated_at)
+                    .unwrap_or_default();
+                right_at
+                    .cmp(&left_at)
+                    .then_with(|| left.cmp(right))
+            });
+            if let Some(keep_id) = matches.first().cloned() {
+                for stale_id in matches.into_iter().skip(1) {
+                    persisted_accounts.remove(&stale_id);
+                    remapped_from.push(stale_id);
+                }
+                keep_id
+            } else {
+                Uuid::new_v4().to_string()
+            }
+        };
+
+        let data = CodexAccountData {
+            account_id: account_id.clone(),
+            chatgpt_account_id: Some(chatgpt_account_id),
+            email,
+            refresh_token,
+            authenticated_at: now,
+            id_token,
+            token_updated_at_ms: now_ms,
+        };
+        let account = GitHubAccount::from(&data);
+
         persisted_accounts.insert(account_id.clone(), data.clone());
-        let persisted_default = self
-            .resolve_default_account_id()
-            .await
-            .or_else(|| Some(account_id.clone()));
+
+        let mut persisted_default = self.default_account_id.read().await.clone();
+        if let Some(default_id) = persisted_default.as_deref() {
+            if remapped_from.iter().any(|old| old == default_id) {
+                persisted_default = Some(account_id.clone());
+            } else if !persisted_accounts.contains_key(default_id) {
+                persisted_default = Self::fallback_default_account_id(&persisted_accounts);
+            }
+        }
+        if persisted_default.is_none() {
+            persisted_default = Some(account_id.clone());
+        }
+
         let store = CodexOAuthStore {
             version: 2,
-            accounts: persisted_accounts,
-            default_account_id: persisted_default,
+            accounts: persisted_accounts.clone(),
+            default_account_id: persisted_default.clone(),
         };
         let content = serde_json::to_string_pretty(&store)
             .map_err(|error| CodexOAuthError::ParseError(error.to_string()))?;
@@ -1840,19 +1912,98 @@ impl CodexOAuthManager {
 
         {
             let mut accounts = self.accounts.write().await;
-            accounts.insert(account_id.clone(), data);
+            *accounts = persisted_accounts;
             let mut access_tokens = self.access_tokens.write().await;
+            for stale_id in &remapped_from {
+                access_tokens.remove(stale_id);
+            }
             if let Some(cached) = initial_access_token {
                 access_tokens.insert(account_id.clone(), cached);
             } else {
                 access_tokens.remove(&account_id);
             }
         }
-        let mut default = self.default_account_id.write().await;
-        if default.is_none() {
-            *default = Some(account_id);
+        {
+            let mut locks = self.refresh_locks.write().await;
+            for stale_id in &remapped_from {
+                locks.remove(stale_id);
+            }
         }
-        Ok(account)
+        {
+            let mut default = self.default_account_id.write().await;
+            *default = persisted_default;
+        }
+
+        for stale_id in &remapped_from {
+            if let Err(err) =
+                crate::codex_config::remap_codex_managed_oauth_live_auth_account_id(
+                    stale_id, &account_id,
+                )
+            {
+                log::warn!(
+                    "[CodexOAuth] failed to remap live auth marker {stale_id} -> {account_id}: {err}"
+                );
+            }
+        }
+
+        Ok(AccountLoginOutcome {
+            account,
+            remapped_from,
+        })
+    }
+
+    /// Find local accounts that represent the same ChatGPT identity.
+    /// Prefer id_token subject + workspace; fall back to email + workspace
+    /// only when the stored account lacks a usable subject.
+    fn find_stable_identity_matches(
+        accounts: &HashMap<String, CodexAccountData>,
+        chatgpt_account_id: &str,
+        email: Option<&str>,
+        new_user_identity: Option<&str>,
+    ) -> Vec<String> {
+        let new_email = email
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        accounts
+            .iter()
+            .filter_map(|(id, account)| {
+                let workspace = account
+                    .chatgpt_account_id
+                    .as_deref()
+                    .unwrap_or(account.account_id.as_str());
+                if workspace != chatgpt_account_id {
+                    return None;
+                }
+
+                let existing_identity = account
+                    .id_token
+                    .as_deref()
+                    .and_then(crate::codex_config::extract_codex_id_token_user_identity);
+
+                match (existing_identity.as_deref(), new_user_identity) {
+                    (Some(existing), Some(candidate)) if existing == candidate => {
+                        return Some(id.clone());
+                    }
+                    (Some(_), Some(_)) => return None,
+                    (Some(_), None) => return None,
+                    (None, _) => {}
+                }
+
+                let existing_email = account
+                    .email
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
+                match (existing_email, new_email) {
+                    (Some(existing), Some(candidate))
+                        if existing.eq_ignore_ascii_case(candidate) =>
+                    {
+                        Some(id.clone())
+                    }
+                    _ => None,
+                }
+            })
+            .collect()
     }
 
     fn fallback_default_account_id(accounts: &HashMap<String, CodexAccountData>) -> Option<String> {
@@ -1970,58 +2121,12 @@ impl CodexOAuthManager {
     }
 
     fn write_store_atomic(&self, content: &str) -> Result<(), CodexOAuthError> {
-        if let Some(parent) = self.storage_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let parent = self
-            .storage_path
-            .parent()
-            .ok_or_else(|| CodexOAuthError::IoError("无效的存储路径".to_string()))?;
-        let file_name = self
-            .storage_path
-            .file_name()
-            .ok_or_else(|| CodexOAuthError::IoError("无效的存储文件名".to_string()))?
-            .to_string_lossy()
-            .to_string();
-        let ts = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let tmp_path = parent.join(format!("{file_name}.tmp.{ts}"));
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-            let mut file = fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .mode(0o600)
-                .open(&tmp_path)?;
-            file.write_all(content.as_bytes())?;
-            file.flush()?;
-
-            fs::rename(&tmp_path, &self.storage_path)?;
-            fs::set_permissions(&self.storage_path, fs::Permissions::from_mode(0o600))?;
-        }
-
-        #[cfg(windows)]
-        {
-            let mut file = fs::OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(&tmp_path)?;
-            file.write_all(content.as_bytes())?;
-            file.flush()?;
-
-            if self.storage_path.exists() {
-                let _ = fs::remove_file(&self.storage_path);
-            }
-            fs::rename(&tmp_path, &self.storage_path)?;
-        }
-
-        Ok(())
+        // Reuse the shared Windows-safe replace path (ReplaceFileW / rename
+        // fallback). The previous delete-then-rename sequence could briefly
+        // remove codex_oauth_auth.json and drop every account on failure.
+        crate::config::atomic_write_private(&self.storage_path, content.as_bytes()).map_err(
+            |error| CodexOAuthError::IoError(error.to_string()),
+        )
     }
 
     fn load_from_disk_sync(&self) -> Result<(), CodexOAuthError> {
@@ -2418,7 +2523,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn concurrent_duplicate_workspace_and_user_identity_is_rejected() {
+    async fn concurrent_same_workspace_and_user_identity_merges_to_one_account() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().to_path_buf();
         let manager = CodexOAuthManager::new(path.clone());
@@ -2443,27 +2548,21 @@ mod tests {
         );
         let (first_result, second_result) = tokio::join!(first, second);
 
-        assert_eq!(
-            [first_result.is_ok(), second_result.is_ok()]
-                .into_iter()
-                .filter(|success| *success)
-                .count(),
-            1
-        );
-        assert!(
-            matches!(first_result, Err(CodexOAuthError::DuplicateAccount))
-                || matches!(second_result, Err(CodexOAuthError::DuplicateAccount))
-        );
+        assert!(first_result.is_ok());
+        assert!(second_result.is_ok());
+        let first_id = first_result.unwrap().id;
+        let second_id = second_result.unwrap().id;
+        assert_eq!(first_id, second_id, "same identity must share one local id");
         assert_eq!(manager.list_accounts().await.len(), 1);
-        assert!(manager.refresh_locks.read().await.is_empty());
         drop(manager);
 
         let reloaded = CodexOAuthManager::new(path);
         assert_eq!(reloaded.list_accounts().await.len(), 1);
+        assert_eq!(reloaded.list_accounts().await[0].id, first_id);
     }
 
     #[tokio::test]
-    async fn duplicate_legacy_workspace_and_user_identity_is_rejected() {
+    async fn duplicate_legacy_workspace_and_user_identity_merges_in_place() {
         let temp = tempfile::tempdir().unwrap();
         let path = temp.path().to_path_buf();
         let manager = CodexOAuthManager::new(path.clone());
@@ -2487,21 +2586,29 @@ mod tests {
         drop(manager);
 
         let manager = CodexOAuthManager::new(path);
-        assert!(matches!(
-            manager
-                .add_account_internal(
-                    "shared-workspace".to_string(),
-                    "rt-duplicate".to_string(),
-                    Some("current@example.com".to_string()),
-                    Some(crate::codex_config::test_codex_id_token("same-user")),
-                    None,
-                    AccountLoginContext::default(),
-                )
-                .await,
-            Err(CodexOAuthError::DuplicateAccount)
-        ));
+        let merged = manager
+            .add_account_internal(
+                "shared-workspace".to_string(),
+                "rt-duplicate".to_string(),
+                Some("current@example.com".to_string()),
+                Some(crate::codex_config::test_codex_id_token("same-user")),
+                None,
+                AccountLoginContext::default(),
+            )
+            .await
+            .expect("legacy same-identity login must merge");
+        assert_eq!(merged.id, "shared-workspace");
         assert_eq!(manager.list_accounts().await.len(), 1);
-        assert!(manager.refresh_locks.read().await.is_empty());
+        assert_eq!(
+            manager
+                .accounts
+                .read()
+                .await
+                .get("shared-workspace")
+                .unwrap()
+                .refresh_token,
+            "rt-duplicate"
+        );
     }
 
     #[tokio::test]
@@ -3490,5 +3597,223 @@ mod tests {
             Some("refresh_token_invalidated")
         );
         assert_eq!(extract_refresh_error_code("not json"), None);
+    }
+
+    #[tokio::test]
+    async fn login_merges_same_identity_in_place_without_dropping_siblings() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = CodexOAuthManager::new(temp.path().to_path_buf());
+        let first = manager
+            .add_account_internal(
+                "ws-a".to_string(),
+                "rt-a-old".to_string(),
+                Some("a@example.com".to_string()),
+                Some(crate::codex_config::test_codex_id_token("user-a")),
+                None,
+                AccountLoginContext::default(),
+            )
+            .await
+            .unwrap();
+        let second = manager
+            .add_account_internal(
+                "ws-b".to_string(),
+                "rt-b".to_string(),
+                Some("b@example.com".to_string()),
+                Some(crate::codex_config::test_codex_id_token("user-b")),
+                None,
+                AccountLoginContext::default(),
+            )
+            .await
+            .unwrap();
+
+        let refreshed = manager
+            .add_account_internal(
+                "ws-a".to_string(),
+                "rt-a-new".to_string(),
+                Some("a@example.com".to_string()),
+                Some(crate::codex_config::test_codex_id_token("user-a")),
+                Some(CachedAccessToken {
+                    token: "access-a-new".to_string(),
+                    expires_at_ms: i64::MAX,
+                    obtained_at_ms: 99,
+                }),
+                AccountLoginContext::default(),
+            )
+            .await
+            .expect("same ChatGPT identity must merge instead of duplicating or failing");
+
+        assert_eq!(refreshed.id, first.id, "local account_id must stay stable");
+        assert_eq!(manager.list_accounts().await.len(), 2);
+        let accounts = manager.accounts.read().await;
+        assert_eq!(accounts.get(&first.id).unwrap().refresh_token, "rt-a-new");
+        assert_eq!(accounts.get(&second.id).unwrap().refresh_token, "rt-b");
+        drop(accounts);
+        assert_eq!(
+            manager
+                .access_tokens
+                .read()
+                .await
+                .get(&first.id)
+                .map(|token| token.token.as_str()),
+            Some("access-a-new")
+        );
+    }
+
+    #[tokio::test]
+    async fn login_merges_by_email_when_existing_lacks_id_token_identity() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = CodexOAuthManager::new(temp.path().to_path_buf());
+        let existing = manager
+            .add_account_internal(
+                "ws-shared".to_string(),
+                "rt-old".to_string(),
+                Some("user@example.com".to_string()),
+                None,
+                None,
+                AccountLoginContext::default(),
+            )
+            .await
+            .unwrap();
+        let sibling = manager
+            .add_account_internal(
+                "ws-other".to_string(),
+                "rt-sibling".to_string(),
+                Some("other@example.com".to_string()),
+                Some(crate::codex_config::test_codex_id_token("other-user")),
+                None,
+                AccountLoginContext::default(),
+            )
+            .await
+            .unwrap();
+
+        let refreshed = manager
+            .add_account_internal(
+                "ws-shared".to_string(),
+                "rt-new".to_string(),
+                Some("user@example.com".to_string()),
+                Some(crate::codex_config::test_codex_id_token("user-a")),
+                None,
+                AccountLoginContext::default(),
+            )
+            .await
+            .expect("email + chatgpt_account_id must merge a reauth_required account");
+
+        assert_eq!(refreshed.id, existing.id);
+        assert_eq!(manager.list_accounts().await.len(), 2);
+        let accounts = manager.accounts.read().await;
+        assert_eq!(accounts.get(&existing.id).unwrap().refresh_token, "rt-new");
+        assert!(accounts.get(&existing.id).unwrap().id_token.is_some());
+        assert_eq!(
+            accounts.get(&sibling.id).unwrap().refresh_token,
+            "rt-sibling"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_default_account_does_not_prune_account_map() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().to_path_buf();
+        let manager = CodexOAuthManager::new(path.clone());
+        let first = manager
+            .add_account_internal(
+                "ws-a".to_string(),
+                "rt-a".to_string(),
+                Some("a@example.com".to_string()),
+                Some(crate::codex_config::test_codex_id_token("user-a")),
+                None,
+                AccountLoginContext::default(),
+            )
+            .await
+            .unwrap();
+        let second = manager
+            .add_account_internal(
+                "ws-b".to_string(),
+                "rt-b".to_string(),
+                Some("b@example.com".to_string()),
+                Some(crate::codex_config::test_codex_id_token("user-b")),
+                None,
+                AccountLoginContext::default(),
+            )
+            .await
+            .unwrap();
+
+        manager.set_default_account(&second.id).await.unwrap();
+        assert_eq!(
+            manager.default_account_id().await.as_deref(),
+            Some(second.id.as_str())
+        );
+        assert_eq!(manager.list_accounts().await.len(), 2);
+
+        let reloaded = CodexOAuthManager::new(path);
+        assert_eq!(reloaded.list_accounts().await.len(), 2);
+        assert_eq!(
+            reloaded.default_account_id().await.as_deref(),
+            Some(second.id.as_str())
+        );
+        assert!(reloaded
+            .list_accounts()
+            .await
+            .iter()
+            .any(|account| account.id == first.id));
+    }
+
+    #[tokio::test]
+    async fn consolidating_duplicate_identity_reports_remapped_account_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let manager = CodexOAuthManager::new(temp.path().to_path_buf());
+        let keep = manager
+            .add_account_internal(
+                "ws-shared".to_string(),
+                "rt-keep".to_string(),
+                Some("user@example.com".to_string()),
+                Some(crate::codex_config::test_codex_id_token("same-user")),
+                None,
+                AccountLoginContext::default(),
+            )
+            .await
+            .unwrap();
+        // Simulate a historical duplicate (same identity, different local id) by
+        // inserting directly — the login path must consolidate and report remap.
+        {
+            let mut accounts = manager.accounts.write().await;
+            accounts.insert(
+                "stale-local-id".to_string(),
+                CodexAccountData {
+                    account_id: "stale-local-id".to_string(),
+                    chatgpt_account_id: Some("ws-shared".to_string()),
+                    email: Some("user@example.com".to_string()),
+                    refresh_token: "rt-stale".to_string(),
+                    authenticated_at: 1,
+                    id_token: Some(crate::codex_config::test_codex_id_token("same-user")),
+                    token_updated_at_ms: 1,
+                },
+            );
+        }
+
+        let outcome = manager
+            .add_account_with_outcome(
+                "ws-shared".to_string(),
+                "rt-new".to_string(),
+                Some("user@example.com".to_string()),
+                Some(crate::codex_config::test_codex_id_token("same-user")),
+                None,
+                AccountLoginContext::default(),
+            )
+            .await
+            .expect("login should consolidate duplicates");
+
+        assert_eq!(outcome.account.id, keep.id);
+        assert_eq!(outcome.remapped_from, vec!["stale-local-id".to_string()]);
+        assert_eq!(manager.list_accounts().await.len(), 1);
+        assert_eq!(
+            manager
+                .accounts
+                .read()
+                .await
+                .get(&keep.id)
+                .unwrap()
+                .refresh_token,
+            "rt-new"
+        );
     }
 }
